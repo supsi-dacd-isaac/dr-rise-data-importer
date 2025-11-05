@@ -6,10 +6,50 @@ from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Any, Iterable
 import datetime as dt
 import json as _json
+import time
 
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util import Retry
+import hashlib
+import base64
+from urllib.parse import urlparse
+import logging
+
+# Module logger
+logger = logging.getLogger(__name__)
+
+
+def setup_logging(level: Optional[str] = None, log_file: Optional[str] = None) -> None:
+    lvl_name = (level or "INFO").upper()
+    lvl = getattr(logging, lvl_name, logging.INFO)
+
+    root = logging.getLogger()
+    for h in list(root.handlers):
+        root.removeHandler(h)
+    root.setLevel(logging.DEBUG)
+
+    fmt = logging.Formatter(
+        fmt="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    sh = logging.StreamHandler()
+    sh.setLevel(lvl)
+    sh.setFormatter(fmt)
+    root.addHandler(sh)
+
+    if log_file:
+        try:
+            fh = logging.FileHandler(log_file)
+            fh.setLevel(lvl)
+            fh.setFormatter(fmt)
+            root.addHandler(fh)
+        except Exception as e:
+            logger.warning("Failed to set log file %s: %s", log_file, e)
+
+    for noisy in ("urllib3", "requests", "influxdb"):
+        logging.getLogger(noisy).setLevel(logging.WARNING if lvl > logging.DEBUG else logging.DEBUG)
 
 
 def iso_to_epoch_ms(iso_str: str) -> int:
@@ -39,6 +79,167 @@ def iso_to_dt(iso_str: str) -> dt.datetime:
         d = d.replace(tzinfo=dt.timezone.utc)
     return d
 
+
+# Helper: format millis epoch to ISO8601 Z string
+
+def ms_to_iso_z(ms: Any) -> str:
+    try:
+        ms_int = int(ms)
+        d = dt.datetime.fromtimestamp(ms_int / 1000.0, tz=dt.timezone.utc)
+        return d.strftime("%Y-%m-%dT%H:%M:%SZ")
+    except Exception:
+        return str(ms)
+
+
+def _fmt_duration(ms_remaining: int) -> str:
+    try:
+        if ms_remaining is None:
+            return "unknown"
+        secs = max(0, int(ms_remaining // 1000))
+        if secs < 60:
+            return f"{secs}s"
+        mins = secs // 60
+        if mins < 60:
+            return f"{mins}m {secs % 60}s"
+        hours = mins // 60
+        if hours < 24:
+            return f"{hours}h {mins % 60}m"
+        days = hours // 24
+        return f"{days}d {hours % 24}h"
+    except Exception:
+        return "unknown"
+
+
+# -------------------- Token cache helpers --------------------
+
+TOKEN_SKEW_MS = 60_000  # 60s safety window
+
+def _token_cache_dir() -> Path:
+    # store tokens next to this script under tkns/
+    d = Path(__file__).resolve().parent / 'tkns'
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _cache_file_name(token_url: str, username: str) -> Path:
+    parsed = urlparse(token_url)
+    host = (parsed.hostname or 'host').replace(':', '_')
+    ident = f"{username}@{host}"
+    h = hashlib.sha1(token_url.encode('utf-8')).hexdigest()[:10]
+    fname = f"{ident}_{h}.json"
+    return _token_cache_dir() / fname
+
+
+def _decode_jwt_exp_ms(token: str) -> Optional[int]:
+    # best-effort decode of JWT exp claim (seconds since epoch)
+    parts = token.split('.')
+    if len(parts) != 3:
+        return None
+    try:
+        payload = parts[1]
+        # base64url decode with padding
+        pad = '=' * (-len(payload) % 4)
+        data = base64.urlsafe_b64decode(payload + pad)
+        obj = json.loads(data.decode('utf-8'))
+        exp = obj.get('exp')
+        if isinstance(exp, (int, float)):
+            return int(float(exp) * 1000)
+    except Exception:
+        return None
+    return None
+
+
+def _load_cached_token(cache_path: Path) -> Optional[Tuple[str, str]]:
+    try:
+        if not cache_path.exists():
+            return None
+        data = json.loads(cache_path.read_text())
+        token = data.get('token')
+        token_type = data.get('token_type') or 'Bearer'
+        expires_at = data.get('expires_at_ms')
+        now_ms = int(dt.datetime.now(dt.timezone.utc).timestamp() * 1000)
+        if token and isinstance(token, str):
+            if isinstance(expires_at, (int, float)):
+                if now_ms + TOKEN_SKEW_MS < int(expires_at):
+                    return token, token_type
+                else:
+                    return None
+            # No expiry info: fall back to JWT exp if possible
+            jwt_exp = _decode_jwt_exp_ms(token)
+            if isinstance(jwt_exp, int) and now_ms + TOKEN_SKEW_MS < jwt_exp:
+                return token, token_type
+    except Exception:
+        return None
+    return None
+
+
+def _save_token(cache_path: Path, token: str, token_type: str, expires_at_ms: Optional[int]) -> None:
+    data = {
+        'token': token,
+        'token_type': token_type,
+        'issued_at_ms': int(dt.datetime.now(dt.timezone.utc).timestamp() * 1000),
+    }
+    if isinstance(expires_at_ms, int):
+        data['expires_at_ms'] = expires_at_ms
+    try:
+        cache_path.write_text(json.dumps(data))
+        try:
+            # best-effort restrict perms on POSIX
+            cache_path.chmod(0o600)
+        except Exception:
+            pass
+    except Exception as e:
+        logger.warning("Failed to write token cache %s: %s", cache_path, e)
+
+
+def _load_cached_token_with_status(cache_path: Path) -> Tuple[Optional[str], Optional[str], Dict[str, Any]]:
+    status: Dict[str, Any] = {
+        'found': False,
+        'usable': False,
+        'reason': None,
+        'expires_at_ms': None,
+        'now_ms': int(dt.datetime.now(dt.timezone.utc).timestamp() * 1000),
+        'skew_ms': TOKEN_SKEW_MS,
+    }
+    try:
+        if not cache_path.exists():
+            status['reason'] = 'not_found'
+            return None, None, status
+        data = json.loads(cache_path.read_text())
+        status['found'] = True
+        token = data.get('token')
+        token_type = data.get('token_type') or 'Bearer'
+        expires_at = data.get('expires_at_ms')
+        status['expires_at_ms'] = expires_at
+        now_ms = status['now_ms']
+        # Evaluate usability
+        if not token or not isinstance(token, str):
+            status['reason'] = 'empty_token'
+            return None, None, status
+        # Expiry known
+        if isinstance(expires_at, (int, float)):
+            if now_ms + TOKEN_SKEW_MS < int(expires_at):
+                status['usable'] = True
+                status['reason'] = 'valid_not_expired'
+                return token, token_type, status
+            else:
+                status['reason'] = 'expired_or_within_skew'
+                return None, None, status
+        # No expiry info: try JWT exp
+        jwt_exp = _decode_jwt_exp_ms(token)
+        status['expires_at_ms'] = jwt_exp
+        if isinstance(jwt_exp, int) and now_ms + TOKEN_SKEW_MS < jwt_exp:
+            status['usable'] = True
+            status['reason'] = 'valid_not_expired_jwt'
+            return token, token_type, status
+        status['reason'] = 'no_expiry_or_jwt_expired'
+        return None, None, status
+    except Exception as e:
+        status['reason'] = f'cache_error:{e.__class__.__name__}'
+        return None, None, status
+
+
+# -------------------------------------------------------------
 
 def compute_intervals(period_cfg) -> List[Tuple[int, int]]:
     # Supports: "lastXh" or {start, end} where same hours are applied for each day between dates
@@ -131,8 +332,28 @@ def _with_timeout(request_func, timeout):
 
 
 def login_get_token(session: requests.Session, token_url: str, username: str, password: str, verify_ssl: bool, form_extras: Optional[Dict[str, str]] = None) -> Tuple[str, str]:
-    print("Logging in…", flush=True)
-    # Form-encoded login as per provided curl
+    # Try cache first with detailed status logging
+    cache_path = _cache_file_name(token_url, username)
+    token, token_type, st = _load_cached_token_with_status(cache_path)
+    if st.get('found') and st.get('usable') and token and token_type:
+        exp_ms = st.get('expires_at_ms')
+        rem = None if exp_ms is None else (st['expires_at_ms'] - st['now_ms'])
+        logger.info(
+            "Token cache hit; reusing token (expires at %s, in %s)",
+            ms_to_iso_z(exp_ms) if exp_ms else 'unknown',
+            _fmt_duration(rem),
+        )
+        return token, token_type
+    else:
+        if not st.get('found'):
+            logger.info("No cached token found; requesting a new token")
+        else:
+            exp_ms = st.get('expires_at_ms')
+            reason = st.get('reason') or 'unusable'
+            when = ms_to_iso_z(exp_ms) if exp_ms else 'unknown'
+            logger.info("Cached token unusable (%s); requesting a new token (cached exp: %s)", reason, when)
+
+    # Form-encoded login
     payload = {
         'username': username,
         'password': password,
@@ -166,9 +387,42 @@ def login_get_token(session: requests.Session, token_url: str, username: str, pa
                 break
     if not token:
         raise RuntimeError(f"Token not found in login response keys: {list(data.keys())}")
-    # Normalize token_type capitalization
     token_type = token_type.capitalize() if isinstance(token_type, str) else 'Bearer'
-    print("Login successful", flush=True)
+
+    # Determine expiry
+    now_ms = int(dt.datetime.now(dt.timezone.utc).timestamp() * 1000)
+    expires_at_ms: Optional[int] = None
+    expires_in = None
+    for k in ('expires_in', 'expiresIn', 'expires'):
+        v = data.get(k)
+        if v is None and isinstance(data.get('data'), dict):
+            v = data['data'].get(k)
+        if isinstance(v, (int, float, str)):
+            try:
+                expires_in = int(float(v))
+                break
+            except Exception:
+                pass
+    if isinstance(expires_in, int) and expires_in > 0:
+        expires_at_ms = now_ms + expires_in * 1000
+    else:
+        jwt_exp = _decode_jwt_exp_ms(token)
+        if isinstance(jwt_exp, int) and jwt_exp > now_ms:
+            expires_at_ms = jwt_exp
+
+    # Log new token expiry info
+    if expires_at_ms:
+        logger.info(
+            "Obtained new token (expires at %s, in %s); caching",
+            ms_to_iso_z(expires_at_ms),
+            _fmt_duration(expires_at_ms - now_ms),
+        )
+    else:
+        logger.info("Obtained new token (expiry unknown); caching")
+
+    # Cache token
+    _save_token(cache_path, token, token_type, expires_at_ms)
+
     return token, token_type
 
 
@@ -393,17 +647,17 @@ def fetch_and_save(session: requests.Session, base_url: str, auth_header_value: 
         params = {"start_ts": start_ms, "end_ts": end_ms}
         out_name = f"{usn}_{telemetry}_{start_ms}_{end_ms}.json"
         out_path = out_dir / out_name
-        print(f"Fetching {usn}/{telemetry} [{start_ms}->{end_ms}]…", flush=True)
+        logger.info("Fetching %s/%s [%s->%s]", usn, telemetry, ms_to_iso_z(start_ms), ms_to_iso_z(end_ms))
         resp = session.get(url, headers=headers, params=params, verify=verify_ssl)
         if not resp.ok:
-            print(f"WARN: Request failed for {usn}/{telemetry}: {resp.status_code} {resp.text[:200]}", file=sys.stderr)
+            logger.warning("Request failed for %s/%s: %s %s", usn, telemetry, resp.status_code, resp.text[:200])
             continue
         if save_json:
             try:
                 out_path.write_text(resp.text)
-                print(f"Saved {out_path}", flush=True)
+                logger.info("Saved %s", out_path)
             except Exception as e:
-                print(f"ERROR: Failed to save {out_path}: {e}", file=sys.stderr)
+                logger.error("Failed to save %s: %s", out_path, e)
 
 
 def load_pairs(usns_cfg: Dict[str, List[str]]) -> List[Tuple[str, str]]:
@@ -440,10 +694,10 @@ def fetch_and_store(session: requests.Session, base_url: str, auth_header_value:
         params = {"start_ts": start_ms, "end_ts": end_ms}
         for usn, telemetry in pairs:
             url = f"{base_url.rstrip('/')}/{usn}/telemetry/{telemetry}"
-            print(f"Fetching {usn}/{telemetry} [{start_ms}->{end_ms}]…", flush=True)
+            logger.info("Fetching %s/%s [%s->%s]", usn, telemetry, ms_to_iso_z(start_ms), ms_to_iso_z(end_ms))
             resp = session.get(url, headers=headers, params=params, verify=verify_ssl)
             if not resp.ok:
-                print(f"WARN: Request failed for {usn}/{telemetry}: {resp.status_code} {resp.text[:200]}", file=sys.stderr)
+                logger.warning("Request failed for %s/%s: %s %s", usn, telemetry, resp.status_code, resp.text[:200])
                 continue
 
             if storage_mode == 'file':
@@ -452,40 +706,57 @@ def fetch_and_store(session: requests.Session, base_url: str, auth_header_value:
                     out_path = out_dir / out_name
                     try:
                         out_path.write_text(resp.text)
-                        print(f"Saved {out_path}", flush=True)
+                        logger.info("Saved %s", out_path)
                     except Exception as e:
-                        print(f"ERROR: Failed to save {out_path}: {e}", file=sys.stderr)
+                        logger.error("Failed to save %s: %s", out_path, e)
             elif storage_mode == 'influx':
                 try:
                     payload = resp.json()
                 except Exception as e:
-                    print(f"ERROR: Response is not JSON for {usn}/{telemetry}: {e}", file=sys.stderr)
+                    logger.error("Response is not JSON for %s/%s: %s", usn, telemetry, e)
                     continue
                 points = parse_points_from_json(usn, telemetry, measurement, payload)
                 if not points:
-                    print(f"WARN: No points parsed for {usn}/{telemetry}", file=sys.stderr)
+                    logger.warning("No points parsed for %s/%s", usn, telemetry)
                     continue
                 try:
                     written = write_points_influx(influx_client, points, time_precision='ms', max_batch=max_batch)
-                    print(f"Wrote {written} points for {usn}/{telemetry}", flush=True)
+                    logger.info("Wrote %s points for %s/%s", written, usn, telemetry)
                 except Exception as e:
-                    print(f"ERROR: Failed to write to InfluxDB for {usn}/{telemetry}: {e}", file=sys.stderr)
+                    logger.error("Failed to write to InfluxDB for %s/%s: %s", usn, telemetry, e)
             else:
-                print(f"ERROR: Unknown storage mode '{storage_mode}'", file=sys.stderr)
+                logger.error("Unknown storage mode '%s'", storage_mode)
                 return
 
 
 def main():
     ap = argparse.ArgumentParser(description="Login and fetch telemetry data using config JSON.")
     ap.add_argument("--config", required=True, help="Path to configuration JSON file.")
+    ap.add_argument("--log-level", default=None, help="Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL). Overrides config.logging.level.")
+    ap.add_argument("--log-file", default=None, help="Optional log file path. Overrides config.logging.file.")
     args = ap.parse_args()
+
+    # Setup logging ASAP (CLI has precedence); may be overridden by config if CLI not provided
+    setup_logging(level=args.log_level, log_file=args.log_file)
+
+    # Start markers
+    run_start_utc = dt.datetime.now(dt.timezone.utc)
+    run_start_perf = time.perf_counter()
+    logger.info("=== Run started === (config=%s)", args.config)
 
     cfg_path = Path(args.config)
     if not cfg_path.exists():
-        print(f"Config not found: {cfg_path}", file=sys.stderr)
+        logger.error("Config not found: %s", cfg_path)
         sys.exit(2)
 
     cfg = json.loads(cfg_path.read_text())
+
+    # Reconfigure logging from config if provided and not overridden by CLI
+    log_cfg = cfg.get("logging", {}) if isinstance(cfg.get("logging"), dict) else {}
+    level = args.log_level or log_cfg.get("level")
+    log_file = args.log_file or log_cfg.get("file")
+    setup_logging(level=level, log_file=log_file)
+    logger.info("Using log level=%s%s", (level or "INFO").upper(), f", file={log_file}" if log_file else "")
 
     rest = cfg.get("rest_api", {})
     auth = rest.get("auth", {})
@@ -500,7 +771,7 @@ def main():
     form_extras = auth.get("form", {})
 
     if not base_url or not token_url or not username or not password:
-        print("Missing required REST config: base_url, auth.token_url, auth.username, auth.password", file=sys.stderr)
+        logger.error("Missing required REST config: base_url, auth.token_url, auth.username, auth.password")
         sys.exit(2)
 
     # period: accept either 'period' (string or dict) or fallback 'periodLast'
@@ -508,22 +779,22 @@ def main():
     if period_cfg is None and cfg.get('periodLast') is not None:
         period_cfg = cfg.get('periodLast')
     if period_cfg is None:
-        print("Missing 'period' in config", file=sys.stderr)
+        logger.error("Missing 'period' in config")
         sys.exit(2)
 
     try:
         intervals = compute_intervals(period_cfg)
     except Exception as e:
-        print(f"Invalid period: {e}", file=sys.stderr)
+        logger.error("Invalid period: %s", e)
         sys.exit(2)
 
     if not intervals:
-        print("No intervals to fetch after parsing period", file=sys.stderr)
+        logger.error("No intervals to fetch after parsing period")
         sys.exit(2)
 
     pairs = load_pairs(cfg.get("usns", {}))
     if not pairs:
-        print("No USN/telemetry pairs configured under 'usns'", file=sys.stderr)
+        logger.error("No USN/telemetry pairs configured under 'usns'")
         sys.exit(2)
 
     # storage selection
@@ -536,8 +807,25 @@ def main():
 
     session = build_session(timeout=timeout, retries_cfg=retries_cfg, headers=headers)
 
-    token, token_type = login_get_token(session, token_url, username, password, verify_ssl, form_extras=form_extras)
+    try:
+        token, token_type = login_get_token(session, token_url, username, password, verify_ssl, form_extras=form_extras)
+    except Exception as e:
+        logger.error("Authentication failed: %s", e)
+        sys.exit(1)
     auth_header_value = f"{token_type} {token}"
+
+    # Log planned work summary
+    starts = [s for (s, _e) in intervals]
+    ends = [e for (_s, e) in intervals]
+    logger.info(
+        "Fetch start: pairs=%d, intervals=%d (%s -> %s), storage=%s, save_json=%s",
+        len(pairs),
+        len(intervals),
+        ms_to_iso_z(min(starts)),
+        ms_to_iso_z(max(ends)),
+        storage_mode,
+        save_json,
+    )
 
     fetch_and_store(
         session=session,
@@ -551,6 +839,15 @@ def main():
         verify_ssl=verify_ssl,
         influx_cfg=influx_cfg,
     )
+
+    # End marker
+    elapsed_s = time.perf_counter() - run_start_perf
+    # simple HH:MM:SS
+    hh = int(elapsed_s // 3600)
+    mm = int((elapsed_s % 3600) // 60)
+    ss = int(elapsed_s % 60)
+    dur = f"{hh:02d}:{mm:02d}:{ss:02d}"
+    logger.info("=== Run finished successfully === (duration=%s)", dur)
 
 
 if __name__ == "__main__":
