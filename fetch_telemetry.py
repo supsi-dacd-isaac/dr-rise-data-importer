@@ -498,13 +498,14 @@ def _extract_country(usn_name: str) -> str:
     return usn_name[:2].upper() if len(usn_name) >= 2 else 'XX'
 
 
-def parse_points_from_json(usn_id: str, usn_name: str, appliance_name: str, measurement: str, payload: Any, asn_id_raw: Any = None) -> List[Dict[str, Any]]:
+def parse_points_from_json(usn_id: str, usn_name: str, appliance_name: str, measurement: str, payload: Any, asn_id_raw: Any = None, appliance_type: Optional[str] = None) -> List[Dict[str, Any]]:
     # Returns list of Influx JSON points with measurement, tags, fields, time (ms)
-    # Tags include: usn_id, usn_name, appliance_name, asn_id, country, signal
+    # Tags include: usn_id, usn_name, appliance_name, appliance_type, asn_id, country, signal
     base_tags = {
         'usn_id': usn_id,
         'usn_name': usn_name,
         'appliance_name': appliance_name,
+        'appliance_type': appliance_type or 'unknown',
         'asn_id': _format_asn_id(asn_id_raw),
         'country': _extract_country(usn_name),
     }
@@ -810,7 +811,7 @@ def auto_discover_pairs(session: requests.Session, base_url: str, auth_header_va
         telemetry_filter: Optional list of telemetry key patterns to filter (if None, fetch all)
     
     Returns:
-        Tuple of (pairs list, usns_dict) where usns_dict maps USN ID -> {name, asn_id, appliances}
+        Tuple of (pairs list, usns_dict) where usns_dict maps USN ID -> {name, asn_id, appliances, appliance_types}
     """
     usns = fetch_all_usns(session, base_url, auth_header_value, verify_ssl)
     logger.info("Discovered %d USNs", len(usns))
@@ -827,14 +828,19 @@ def auto_discover_pairs(session: requests.Session, base_url: str, auth_header_va
         usn_name = usn_data.get('name', usn_id)
         asn_id_raw = usn_data.get('asn_id')  # e.g., 1, 2, etc.
         
+        telemetry_keys = []
+        appliance_types: Dict[str, str] = {}  # Maps appliance_id -> appliance_type
+        
         if use_appliances:
             # Get appliances for this USN
             appliances = fetch_usn_appliances(session, base_url, auth_header_value, usn_id, verify_ssl)
-            telemetry_keys = []
             for appl in appliances:
                 appl_id = appl.get('appliance_id') or appl.get('id') or appl.get('name')
+                appl_type = appl.get('appliance_type') or appl.get('type')
                 if appl_id:
                     telemetry_keys.append(appl_id)
+                    if appl_type:
+                        appliance_types[appl_id] = appl_type
             logger.info("USN %s (%s): found %d appliances: %s", usn_id, usn_name, len(telemetry_keys), telemetry_keys)
         else:
             # Get telemetry keys directly
@@ -856,7 +862,8 @@ def auto_discover_pairs(session: requests.Session, base_url: str, auth_header_va
         usns_dict[usn_id] = {
             'name': usn_name,
             'asn_id': asn_id_raw,
-            'appliances': telemetry_keys
+            'appliances': telemetry_keys,
+            'appliance_types': appliance_types
         }
         
         # Only add to pairs if there are telemetry keys to fetch
@@ -916,6 +923,9 @@ def fetch_and_store(session: requests.Session, base_url: str, auth_header_value:
             meta = usn_metadata.get(usn_id, {})
             usn_name = meta.get('name', usn_id)
             asn_id_raw = meta.get('asn_id')
+            # Get appliance_type from metadata if available
+            appliance_types = meta.get('appliance_types', {})
+            appliance_type = appliance_types.get(appliance_name)
             
             url = f"{base_url.rstrip('/')}/{usn_id}/telemetry/{appliance_name}"
             logger.info("Fetching %s (%s) / %s [%s->%s]", usn_id, usn_name, appliance_name, ms_to_iso_z(start_ms), ms_to_iso_z(end_ms))
@@ -939,7 +949,7 @@ def fetch_and_store(session: requests.Session, base_url: str, auth_header_value:
                 except Exception as e:
                     logger.error("Response is not JSON for %s/%s: %s", usn_id, appliance_name, e)
                     continue
-                points = parse_points_from_json(usn_id, usn_name, appliance_name, measurement, payload, asn_id_raw)
+                points = parse_points_from_json(usn_id, usn_name, appliance_name, measurement, payload, asn_id_raw, appliance_type)
                 if not points:
                     logger.warning("No points parsed for %s/%s", usn_id, appliance_name)
                     continue
@@ -1063,9 +1073,13 @@ def main():
             out_cfg_path = out_dir / "discovered_usns.json"
             save_discovered_config(usns_dict, out_cfg_path)
         
-        # Extract USN ID -> metadata mapping for tagging
+        # Extract USN ID -> metadata mapping for tagging (includes appliance_types)
         usn_metadata: Dict[str, Dict[str, Any]] = {
-            usn_id: {'name': info['name'], 'asn_id': info.get('asn_id')}
+            usn_id: {
+                'name': info['name'],
+                'asn_id': info.get('asn_id'),
+                'appliance_types': info.get('appliance_types', {})
+            }
             for usn_id, info in usns_dict.items()
         }
     else:

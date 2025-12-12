@@ -139,6 +139,7 @@ When `auto_discover.save_discovered` is `true`, a JSON file is saved with all di
   - `usn_id`: UUID of the USN (e.g., `5b175a90-7cd9-11f0-9a52-63eb4102b574`)
   - `usn_name`: Human-readable name (e.g., `ES_01`)
   - `appliance_name`: Appliance identifier (e.g., `01_A01`)
+  - `appliance_type`: Type of the appliance retrieved from the API (e.g., `smart_meter`, `pv_inverter`)
   - `asn_id`: Formatted ASN identifier (e.g., `ASN_01` from raw value `1`)
   - `country`: Country code extracted from USN name (e.g., `ES` from `ES_01`)
   - `signal`: Telemetry signal name (e.g., `energy_consumed`)
@@ -155,7 +156,10 @@ SELECT * FROM usn_data WHERE usn_name = 'ES_01' AND appliance_name = '01_A01' LI
 -- Aggregate by USN
 SELECT mean(value) FROM usn_data WHERE time > now() - 1d GROUP BY usn_name, signal
 
--- Filter by appliance type
+-- Filter by appliance type (from API)
+SELECT sum(value) FROM usn_data WHERE appliance_type = 'smart_meter' GROUP BY usn_name
+
+-- Filter by appliance name pattern (legacy)
 SELECT sum(value) FROM usn_data WHERE appliance_name =~ /.*_A.*/ GROUP BY usn_name
 
 -- Filter by country
