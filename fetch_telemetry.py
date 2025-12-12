@@ -476,15 +476,46 @@ KNOWN_TS_KEYS = {'ts', 'timestamp', 'time', 'date', 'datetime'}
 META_KEYS = KNOWN_TS_KEYS | {'id', 'usn', 'key', 'signal', 'unit', 'quality', 'status'}
 
 
-def parse_points_from_json(usn: str, telemetry_key: str, measurement: str, payload: Any) -> List[Dict[str, Any]]:
+def _format_asn_id(asn_id_raw: Any) -> str:
+    """Format raw asn_id (e.g., 1) to tag format (e.g., 'ASN_01')."""
+    if asn_id_raw is None:
+        return 'ASN_00'
+    try:
+        asn_num = int(asn_id_raw)
+        return f'ASN_{asn_num:02d}'
+    except (ValueError, TypeError):
+        return f'ASN_{asn_id_raw}'
+
+
+def _extract_country(usn_name: str) -> str:
+    """Extract country code from USN name (e.g., 'ES_01' -> 'ES')."""
+    if not usn_name:
+        return 'XX'
+    # Split by underscore and take the first part
+    parts = usn_name.split('_')
+    if parts and len(parts[0]) >= 2:
+        return parts[0].upper()
+    return usn_name[:2].upper() if len(usn_name) >= 2 else 'XX'
+
+
+def parse_points_from_json(usn_id: str, usn_name: str, appliance_name: str, measurement: str, payload: Any, asn_id_raw: Any = None) -> List[Dict[str, Any]]:
     # Returns list of Influx JSON points with measurement, tags, fields, time (ms)
+    # Tags include: usn_id, usn_name, appliance_name, asn_id, country, signal
+    base_tags = {
+        'usn_id': usn_id,
+        'usn_name': usn_name,
+        'appliance_name': appliance_name,
+        'asn_id': _format_asn_id(asn_id_raw),
+        'country': _extract_country(usn_name),
+    }
+    
     items: List[Dict[str, Any]]
     if isinstance(payload, list):
         items = payload
     elif isinstance(payload, dict):
         # Case: payload has the telemetry key pointing to the array of samples
-        if telemetry_key in payload and isinstance(payload[telemetry_key], list):
-            items = payload[telemetry_key]
+        if appliance_name in payload and isinstance(payload[appliance_name], list):
+            items = payload[appliance_name]
         else:
             # Try common container keys
             for k in ('data', 'items', 'telemetry', 'values', 'result', 'results'):
@@ -524,7 +555,7 @@ def parse_points_from_json(usn: str, telemetry_key: str, measurement: str, paylo
                                 continue
                             points.append({
                                 'measurement': measurement,
-                                'tags': {'usn': usn, 'key': telemetry_key, 'signal': str(sig)},
+                                'tags': {**base_tags, 'signal': str(sig)},
                                 'time': ts,
                                 'fields': {'value': float(val)}
                             })
@@ -559,7 +590,7 @@ def parse_points_from_json(usn: str, telemetry_key: str, measurement: str, paylo
                         if isinstance(val, (int, float)):
                             points.append({
                                 'measurement': measurement,
-                                'tags': {'usn': usn, 'key': telemetry_key, 'signal': str(sig)},
+                                'tags': {**base_tags, 'signal': str(sig)},
                                 'time': ts,
                                 'fields': {'value': float(val)}
                             })
@@ -576,7 +607,7 @@ def parse_points_from_json(usn: str, telemetry_key: str, measurement: str, paylo
                 val = it[sig]
                 points.append({
                     'measurement': measurement,
-                    'tags': {'usn': usn, 'key': telemetry_key, 'signal': str(sig)},
+                    'tags': {**base_tags, 'signal': str(sig)},
                     'time': ts,
                     'fields': {'value': float(val)}
                 })
@@ -591,7 +622,7 @@ def parse_points_from_json(usn: str, telemetry_key: str, measurement: str, paylo
             sig = it.get('signal') or it.get('name') or 'value'
             points.append({
                 'measurement': measurement,
-                'tags': {'usn': usn, 'key': telemetry_key, 'signal': str(sig)},
+                'tags': {**base_tags, 'signal': str(sig)},
                 'time': ts,
                 'fields': {'value': float(val)}
             })
@@ -668,11 +699,199 @@ def load_pairs(usns_cfg: Dict[str, List[str]]) -> List[Tuple[str, str]]:
     return pairs
 
 
-def fetch_and_store(session: requests.Session, base_url: str, auth_header_value: str, pairs: List[Tuple[str, str]], intervals: List[Tuple[int, int]], storage_mode: str, out_dir: Path, save_json: bool, verify_ssl: bool, influx_cfg: Optional[Dict[str, Any]]) -> None:
+# -------------------- Auto-discovery functions --------------------
+
+def fetch_all_usns(session: requests.Session, base_url: str, auth_header_value: str, verify_ssl: bool) -> List[Dict[str, Any]]:
+    """Fetch all USNs from the API (/usn endpoint)."""
+    # base_url is like "https://api.drrise.idener.ai/usn/" - we need root
+    api_root = base_url.rstrip('/').rsplit('/usn', 1)[0]
+    url = f"{api_root}/usn"
+    headers = {"Authorization": auth_header_value, "Accept": "application/json"}
+    logger.info("Fetching all USNs from %s", url)
+    resp = session.get(url, headers=headers, verify=verify_ssl)
+    if not resp.ok:
+        raise RuntimeError(f"Failed to fetch USNs: {resp.status_code} {resp.text[:300]}")
+    try:
+        data = resp.json()
+    except Exception as e:
+        raise RuntimeError(f"USN response is not JSON: {e}")
+    
+    # API may return a list directly or wrapped in a container
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        for key in ('data', 'items', 'usns', 'results'):
+            if isinstance(data.get(key), list):
+                return data[key]
+        # If dict with USN IDs as keys
+        if all(isinstance(v, dict) for v in data.values()):
+            return [{'id': k, **v} for k, v in data.items()]
+    return []
+
+
+def fetch_usn_details(session: requests.Session, base_url: str, auth_header_value: str, usn_id: str, verify_ssl: bool) -> Dict[str, Any]:
+    """Fetch details for a specific USN by UUID."""
+    url = f"{base_url.rstrip('/')}/{usn_id}"
+    headers = {"Authorization": auth_header_value, "Accept": "application/json"}
+    logger.debug("Fetching USN details: %s", url)
+    resp = session.get(url, headers=headers, verify=verify_ssl)
+    if not resp.ok:
+        logger.warning("Failed to fetch USN details for %s: %s", usn_id, resp.status_code)
+        return {}
+    try:
+        return resp.json()
+    except Exception:
+        return {}
+
+
+def fetch_usn_appliances(session: requests.Session, base_url: str, auth_header_value: str, usn_id: str, verify_ssl: bool) -> List[Dict[str, Any]]:
+    """Fetch all appliances for a specific USN (/usn/{id}/appliances)."""
+    url = f"{base_url.rstrip('/')}/{usn_id}/appliances"
+    headers = {"Authorization": auth_header_value, "Accept": "application/json"}
+    logger.debug("Fetching appliances for USN %s: %s", usn_id, url)
+    resp = session.get(url, headers=headers, verify=verify_ssl)
+    if not resp.ok:
+        logger.warning("Failed to fetch appliances for USN %s: %s %s", usn_id, resp.status_code, resp.text[:200])
+        return []
+    try:
+        data = resp.json()
+    except Exception as e:
+        logger.warning("Appliances response is not JSON for %s: %s", usn_id, e)
+        return []
+    
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        for key in ('data', 'items', 'appliances', 'results'):
+            if isinstance(data.get(key), list):
+                return data[key]
+    return []
+
+
+def fetch_usn_telemetry_keys(session: requests.Session, base_url: str, auth_header_value: str, usn_id: str, verify_ssl: bool) -> List[str]:
+    """Fetch available telemetry keys for a USN (/usn/{id}/telemetry)."""
+    url = f"{base_url.rstrip('/')}/{usn_id}/telemetry"
+    headers = {"Authorization": auth_header_value, "Accept": "application/json"}
+    logger.debug("Fetching telemetry keys for USN %s: %s", usn_id, url)
+    resp = session.get(url, headers=headers, verify=verify_ssl)
+    if not resp.ok:
+        logger.warning("Failed to fetch telemetry keys for USN %s: %s", usn_id, resp.status_code)
+        return []
+    try:
+        data = resp.json()
+    except Exception:
+        return []
+    
+    # Response is typically a dict with telemetry keys as keys
+    if isinstance(data, dict):
+        return list(data.keys())
+    if isinstance(data, list):
+        # May be list of dicts with 'key' field
+        keys = []
+        for item in data:
+            if isinstance(item, dict) and 'key' in item:
+                keys.append(item['key'])
+            elif isinstance(item, str):
+                keys.append(item)
+        return keys
+    return []
+
+
+def auto_discover_pairs(session: requests.Session, base_url: str, auth_header_value: str, verify_ssl: bool, use_appliances: bool = True, telemetry_filter: Optional[List[str]] = None) -> Tuple[List[Tuple[str, str]], Dict[str, Dict[str, Any]]]:
+    """
+    Auto-discover USNs and their telemetry keys/appliances from the API.
+    
+    Args:
+        session: HTTP session
+        base_url: Base URL for USN endpoints
+        auth_header_value: Authorization header value
+        verify_ssl: Whether to verify SSL
+        use_appliances: If True, use appliance IDs as telemetry keys; if False, use telemetry endpoint
+        telemetry_filter: Optional list of telemetry key patterns to filter (if None, fetch all)
+    
+    Returns:
+        Tuple of (pairs list, usns_dict) where usns_dict maps USN ID -> {name, asn_id, appliances}
+    """
+    usns = fetch_all_usns(session, base_url, auth_header_value, verify_ssl)
+    logger.info("Discovered %d USNs", len(usns))
+    
+    pairs: List[Tuple[str, str]] = []
+    usns_dict: Dict[str, Dict[str, Any]] = {}
+    
+    for usn_data in usns:
+        usn_id = usn_data.get('id') or usn_data.get('uuid') or usn_data.get('usn_id')
+        if not usn_id:
+            logger.warning("USN entry missing ID: %s", usn_data)
+            continue
+        
+        usn_name = usn_data.get('name', usn_id)
+        asn_id_raw = usn_data.get('asn_id')  # e.g., 1, 2, etc.
+        
+        if use_appliances:
+            # Get appliances for this USN
+            appliances = fetch_usn_appliances(session, base_url, auth_header_value, usn_id, verify_ssl)
+            telemetry_keys = []
+            for appl in appliances:
+                appl_id = appl.get('appliance_id') or appl.get('id') or appl.get('name')
+                if appl_id:
+                    telemetry_keys.append(appl_id)
+            logger.info("USN %s (%s): found %d appliances: %s", usn_id, usn_name, len(telemetry_keys), telemetry_keys)
+        else:
+            # Get telemetry keys directly
+            telemetry_keys = fetch_usn_telemetry_keys(session, base_url, auth_header_value, usn_id, verify_ssl)
+            logger.info("USN %s (%s): found %d telemetry keys", usn_id, usn_name, len(telemetry_keys))
+        
+        # Apply filter if provided
+        if telemetry_filter:
+            import fnmatch
+            filtered_keys = []
+            for key in telemetry_keys:
+                for pattern in telemetry_filter:
+                    if fnmatch.fnmatch(key, pattern):
+                        filtered_keys.append(key)
+                        break
+            telemetry_keys = filtered_keys
+        
+        # Always save the USN info (even if no appliances)
+        usns_dict[usn_id] = {
+            'name': usn_name,
+            'asn_id': asn_id_raw,
+            'appliances': telemetry_keys
+        }
+        
+        # Only add to pairs if there are telemetry keys to fetch
+        for key in telemetry_keys:
+            pairs.append((usn_id, key))
+    
+    return pairs, usns_dict
+
+
+def save_discovered_config(usns_dict: Dict[str, Dict[str, Any]], out_path: Path) -> None:
+    """Save discovered USNs and telemetry keys to a JSON file for reference."""
+    data = {
+        'discovered_at': dt.datetime.now(dt.timezone.utc).isoformat(),
+        'usns': usns_dict
+    }
+    try:
+        out_path.write_text(json.dumps(data, indent=2))
+        logger.info("Saved discovered configuration to %s", out_path)
+    except Exception as e:
+        logger.warning("Failed to save discovered config: %s", e)
+
+
+def fetch_and_store(session: requests.Session, base_url: str, auth_header_value: str, pairs: List[Tuple[str, str]], intervals: List[Tuple[int, int]], storage_mode: str, out_dir: Path, save_json: bool, verify_ssl: bool, influx_cfg: Optional[Dict[str, Any]], usn_metadata: Optional[Dict[str, Dict[str, Any]]] = None) -> None:
+    """
+    Fetch telemetry data and store it.
+    
+    Args:
+        usn_metadata: Optional mapping of USN ID -> {name, asn_id} for tagging in InfluxDB
+    """
     headers = {"Authorization": auth_header_value, "Accept": "application/json"}
     influx_client = None
     measurement = None
     max_batch = 5000
+    usn_metadata = usn_metadata or {}
+    
     if storage_mode == 'influx':
         if not influx_cfg:
             raise RuntimeError("Influx storage selected but 'influxdb' config missing")
@@ -692,17 +911,22 @@ def fetch_and_store(session: requests.Session, base_url: str, auth_header_value:
 
     for (start_ms, end_ms) in intervals:
         params = {"start_ts": start_ms, "end_ts": end_ms}
-        for usn, telemetry in pairs:
-            url = f"{base_url.rstrip('/')}/{usn}/telemetry/{telemetry}"
-            logger.info("Fetching %s/%s [%s->%s]", usn, telemetry, ms_to_iso_z(start_ms), ms_to_iso_z(end_ms))
+        for usn_id, appliance_name in pairs:
+            # Get USN metadata from mapping, fallback to defaults
+            meta = usn_metadata.get(usn_id, {})
+            usn_name = meta.get('name', usn_id)
+            asn_id_raw = meta.get('asn_id')
+            
+            url = f"{base_url.rstrip('/')}/{usn_id}/telemetry/{appliance_name}"
+            logger.info("Fetching %s (%s) / %s [%s->%s]", usn_id, usn_name, appliance_name, ms_to_iso_z(start_ms), ms_to_iso_z(end_ms))
             resp = session.get(url, headers=headers, params=params, verify=verify_ssl)
             if not resp.ok:
-                logger.warning("Request failed for %s/%s: %s %s", usn, telemetry, resp.status_code, resp.text[:200])
+                logger.warning("Request failed for %s/%s: %s %s", usn_id, appliance_name, resp.status_code, resp.text[:200])
                 continue
 
             if storage_mode == 'file':
                 if save_json:
-                    out_name = f"{usn}_{telemetry}_{start_ms}_{end_ms}.json"
+                    out_name = f"{usn_id}_{appliance_name}_{start_ms}_{end_ms}.json"
                     out_path = out_dir / out_name
                     try:
                         out_path.write_text(resp.text)
@@ -713,17 +937,17 @@ def fetch_and_store(session: requests.Session, base_url: str, auth_header_value:
                 try:
                     payload = resp.json()
                 except Exception as e:
-                    logger.error("Response is not JSON for %s/%s: %s", usn, telemetry, e)
+                    logger.error("Response is not JSON for %s/%s: %s", usn_id, appliance_name, e)
                     continue
-                points = parse_points_from_json(usn, telemetry, measurement, payload)
+                points = parse_points_from_json(usn_id, usn_name, appliance_name, measurement, payload, asn_id_raw)
                 if not points:
-                    logger.warning("No points parsed for %s/%s", usn, telemetry)
+                    logger.warning("No points parsed for %s/%s", usn_id, appliance_name)
                     continue
                 try:
                     written = write_points_influx(influx_client, points, time_precision='ms', max_batch=max_batch)
-                    logger.info("Wrote %s points for %s/%s", written, usn, telemetry)
+                    logger.info("Wrote %s points for %s (%s) / %s", written, usn_id, usn_name, appliance_name)
                 except Exception as e:
-                    logger.error("Failed to write to InfluxDB for %s/%s: %s", usn, telemetry, e)
+                    logger.error("Failed to write to InfluxDB for %s/%s: %s", usn_id, appliance_name, e)
             else:
                 logger.error("Unknown storage mode '%s'", storage_mode)
                 return
@@ -792,11 +1016,6 @@ def main():
         logger.error("No intervals to fetch after parsing period")
         sys.exit(2)
 
-    pairs = load_pairs(cfg.get("usns", {}))
-    if not pairs:
-        logger.error("No USN/telemetry pairs configured under 'usns'")
-        sys.exit(2)
-
     # storage selection
     storage_mode = (cfg.get('storage') or 'file').lower()
     output_cfg = cfg.get("output", {})
@@ -805,14 +1024,68 @@ def main():
 
     influx_cfg = cfg.get('influxdb') if storage_mode == 'influx' else None
 
+    # Build session early - needed for both auto-discovery and regular fetching
     session = build_session(timeout=timeout, retries_cfg=retries_cfg, headers=headers)
 
-    try:
-        token, token_type = login_get_token(session, token_url, username, password, verify_ssl, form_extras=form_extras)
-    except Exception as e:
-        logger.error("Authentication failed: %s", e)
-        sys.exit(1)
-    auth_header_value = f"{token_type} {token}"
+    # Auto-discovery or manual pairs configuration
+    auto_discover_cfg = cfg.get("auto_discover", {})
+    if isinstance(auto_discover_cfg, bool):
+        auto_discover_cfg = {"enabled": auto_discover_cfg}
+    
+    if auto_discover_cfg.get("enabled", False):
+        logger.info("Auto-discovery mode enabled - fetching USNs and appliances from API")
+        # Authenticate first for discovery
+        try:
+            token, token_type = login_get_token(session, token_url, username, password, verify_ssl, form_extras=form_extras)
+        except Exception as e:
+            logger.error("Authentication failed: %s", e)
+            sys.exit(1)
+        auth_header_value = f"{token_type} {token}"
+        
+        use_appliances = auto_discover_cfg.get("use_appliances", True)
+        telemetry_filter = auto_discover_cfg.get("telemetry_filter", None)
+        
+        pairs, usns_dict = auto_discover_pairs(
+            session=session,
+            base_url=base_url,
+            auth_header_value=auth_header_value,
+            verify_ssl=verify_ssl,
+            use_appliances=use_appliances,
+            telemetry_filter=telemetry_filter
+        )
+        
+        if not pairs:
+            logger.error("No USN/telemetry pairs discovered from API")
+            sys.exit(2)
+        
+        # Optionally save discovered config
+        if auto_discover_cfg.get("save_discovered", False):
+            out_cfg_path = out_dir / "discovered_usns.json"
+            save_discovered_config(usns_dict, out_cfg_path)
+        
+        # Extract USN ID -> metadata mapping for tagging
+        usn_metadata: Dict[str, Dict[str, Any]] = {
+            usn_id: {'name': info['name'], 'asn_id': info.get('asn_id')}
+            for usn_id, info in usns_dict.items()
+        }
+    else:
+        # Manual mode - use pairs from config (check both 'usns' and 'usns_manual')
+        usns_cfg = cfg.get("usns") or cfg.get("usns_manual") or {}
+        pairs = load_pairs(usns_cfg)
+        if not pairs:
+            logger.error("No USN/telemetry pairs configured under 'usns' or 'usns_manual'")
+            sys.exit(2)
+        
+        # In manual mode, we don't have USN metadata - will use defaults
+        usn_metadata = {}
+        
+        # Authenticate
+        try:
+            token, token_type = login_get_token(session, token_url, username, password, verify_ssl, form_extras=form_extras)
+        except Exception as e:
+            logger.error("Authentication failed: %s", e)
+            sys.exit(1)
+        auth_header_value = f"{token_type} {token}"
 
     # Log planned work summary
     starts = [s for (s, _e) in intervals]
@@ -838,6 +1111,7 @@ def main():
         save_json=save_json,
         verify_ssl=verify_ssl,
         influx_cfg=influx_cfg,
+        usn_metadata=usn_metadata,
     )
 
     # End marker
