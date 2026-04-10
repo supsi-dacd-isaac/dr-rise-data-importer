@@ -19,6 +19,18 @@ import logging
 # Module logger
 logger = logging.getLogger(__name__)
 
+SENSITIVE_LOG_KEYS = (
+    "authorization",
+    "password",
+    "secret",
+    "token",
+    "jwt",
+    "bearer",
+    "cookie",
+    "api_key",
+    "apikey",
+)
+
 
 def setup_logging(level: Optional[str] = None, log_file: Optional[str] = None) -> None:
     lvl_name = (level or "INFO").upper()
@@ -50,6 +62,54 @@ def setup_logging(level: Optional[str] = None, log_file: Optional[str] = None) -
 
     for noisy in ("urllib3", "requests", "influxdb"):
         logging.getLogger(noisy).setLevel(logging.WARNING if lvl > logging.DEBUG else logging.DEBUG)
+
+
+def _is_sensitive_log_key(key: Any) -> bool:
+    if key is None:
+        return False
+    key_l = str(key).lower()
+    return any(marker in key_l for marker in SENSITIVE_LOG_KEYS)
+
+
+def _mask_sensitive_value(value: Any) -> str:
+    if value is None:
+        return "***"
+    text = str(value)
+    if not text:
+        return "***"
+    if len(text) <= 8:
+        return "***"
+    return f"{text[:4]}...{text[-4:]}"
+
+
+def _sanitize_for_log(value: Any, key_hint: Any = None) -> Any:
+    if _is_sensitive_log_key(key_hint):
+        if isinstance(value, str) and str(key_hint).lower() == "authorization" and " " in value:
+            scheme, token = value.split(" ", 1)
+            return f"{scheme} {_mask_sensitive_value(token)}"
+        return _mask_sensitive_value(value)
+
+    if isinstance(value, dict):
+        return {str(k): _sanitize_for_log(v, k) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_sanitize_for_log(v) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_sanitize_for_log(v) for v in value)
+    if isinstance(value, bytes):
+        try:
+            return value.decode("utf-8")
+        except Exception:
+            return f"<{len(value)} bytes>"
+    return value
+
+
+def _compact_log_repr(value: Any) -> str:
+    if value is None:
+        return "-"
+    try:
+        return _json.dumps(value, ensure_ascii=True, separators=(",", ":"), default=str)
+    except Exception:
+        return repr(value)
 
 
 def iso_to_epoch_ms(iso_str: str) -> int:
@@ -318,16 +378,46 @@ def build_session(timeout: int, retries_cfg: Dict, headers: Dict) -> requests.Se
     session.mount('http://', adapter)
     session.mount('https://', adapter)
 
-    # Store default timeout on session
-    session.request = _with_timeout(session.request, timeout)
+    # Store default timeout on session and attach debug request tracing.
+    session.request = _with_timeout_and_debug(session, session.request, timeout)
     return session
 
 
-def _with_timeout(request_func, timeout):
+def _with_timeout_and_debug(session: requests.Session, request_func, timeout):
     def wrapper(method, url, **kwargs):
         if 'timeout' not in kwargs or kwargs['timeout'] is None:
             kwargs['timeout'] = timeout
-        return request_func(method, url, **kwargs)
+        if logger.isEnabledFor(logging.DEBUG):
+            merged_headers = dict(session.headers)
+            if isinstance(kwargs.get("headers"), dict):
+                merged_headers.update(kwargs["headers"])
+            logger.debug(
+                "HTTP request method=%s url=%s params=%s data=%s json=%s headers=%s timeout=%s verify_ssl=%s",
+                str(method).upper(),
+                url,
+                _compact_log_repr(_sanitize_for_log(kwargs.get("params"), "params")),
+                _compact_log_repr(_sanitize_for_log(kwargs.get("data"), "data")),
+                _compact_log_repr(_sanitize_for_log(kwargs.get("json"), "json")),
+                _compact_log_repr(_sanitize_for_log(merged_headers, "headers")),
+                kwargs.get("timeout"),
+                kwargs.get("verify"),
+            )
+        try:
+            response = request_func(method, url, **kwargs)
+        except Exception as exc:
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug("HTTP request failed method=%s url=%s error=%s", str(method).upper(), url, exc)
+            raise
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "HTTP response method=%s url=%s status=%s ok=%s content_type=%s",
+                str(method).upper(),
+                url,
+                response.status_code,
+                response.ok,
+                response.headers.get("Content-Type"),
+            )
+        return response
     return wrapper
 
 
@@ -966,7 +1056,7 @@ def fetch_and_store(session: requests.Session, base_url: str, auth_header_value:
 def main():
     ap = argparse.ArgumentParser(description="Login and fetch telemetry data using config JSON.")
     ap.add_argument("--config", required=True, help="Path to configuration JSON file.")
-    ap.add_argument("--log-level", default=None, help="Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL). Overrides config.logging.level.")
+    ap.add_argument("--log-level", default=None, help="Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL). Overrides config.log_level and config.logging.level.")
     ap.add_argument("--log-file", default=None, help="Optional log file path. Overrides config.logging.file.")
     args = ap.parse_args()
 
@@ -987,7 +1077,7 @@ def main():
 
     # Reconfigure logging from config if provided and not overridden by CLI
     log_cfg = cfg.get("logging", {}) if isinstance(cfg.get("logging"), dict) else {}
-    level = args.log_level or log_cfg.get("level")
+    level = args.log_level or cfg.get("log_level") or log_cfg.get("level")
     log_file = args.log_file or log_cfg.get("file")
     setup_logging(level=level, log_file=log_file)
     logger.info("Using log level=%s%s", (level or "INFO").upper(), f", file={log_file}" if log_file else "")
