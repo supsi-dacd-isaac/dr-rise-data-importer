@@ -39,13 +39,12 @@ Automatically discover USNs and their appliances from the API:
 - `telemetry_filter`: Optional list of patterns to filter appliances (e.g., `["*_A*"]` for only aggregated meters)
 - `save_discovered`: If `true`, saves discovered USNs/appliances to `data/discovered_usns.json`
 
-### Manual USN Configuration
-When `auto_discover.enabled` is `false`, configure USNs manually:
+### Saved Discovery File Mode
+When `auto_discover.enabled` is `false`, the importer reads USNs and appliances from the discovered JSON file instead of calling discovery endpoints. By default it reads `<output.directory>/discovered_usns.json`; use `--discovered-usns-json` to select another file.
 
 ```json
-"usns": {
-  "5b175a90-7cd9-11f0-9a52-63eb4102b574": ["01_A01"],
-  "68444f20-7cd9-11f0-9a52-63eb4102b574": ["02_A02"]
+"auto_discover": {
+  "enabled": false
 }
 ```
 
@@ -71,7 +70,7 @@ python fetch_telemetry.py --config conf/config_all.json
 - `--config`: Path to configuration JSON file (required)
 - `--log-level`: Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
 - `--log-file`: Optional log file path
-- `--discovered-usns-json`: Optional path for the auto-discovery JSON saved when `auto_discover.save_discovered` is `true` (default: `<output.directory>/discovered_usns.json`)
+- `--discovered-usns-json`: Optional path for the discovered USNs/appliances JSON. The file is saved when `auto_discover.save_discovered` is `true` and loaded when `auto_discover.enabled` is `false` (default: `<output.directory>/discovered_usns.json`)
 
 ### Examples
 
@@ -95,9 +94,9 @@ python fetch_telemetry.py --config conf/config_all.json --log-level INFO --log-f
 python fetch_telemetry.py --config conf/config_all.json --discovered-usns-json data/site_a_discovered_usns.json
 ```
 
-**Run with manual USN configuration:**
+**Run from a saved discovered USNs/appliances JSON file:**
 ```bash
-python fetch_telemetry.py --config conf/config.json
+python fetch_telemetry.py --config conf/config.json --discovered-usns-json data/site_a_discovered_usns.json
 ```
 
 **One-liner (activate venv and run):**
@@ -119,7 +118,7 @@ PYTHONPATH=/path/to/dr-rise-data-importer python fetch_telemetry.py --config con
 ## Output Files
 
 ### Discovered USNs (`data/discovered_usns.json`)
-When `auto_discover.save_discovered` is `true`, a JSON file is saved with all discovered USNs:
+When `auto_discover.save_discovered` is `true`, a JSON file is saved with all discovered USNs. When `auto_discover.enabled` is `false`, this same file format is used as the input for USNs and appliances:
 
 ```json
 {

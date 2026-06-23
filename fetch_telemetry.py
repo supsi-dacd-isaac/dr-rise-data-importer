@@ -782,12 +782,49 @@ def fetch_and_save(session: requests.Session, base_url: str, auth_header_value: 
                 logger.error("Failed to save %s: %s", out_path, e)
 
 
-def load_pairs(usns_cfg: Dict[str, List[str]]) -> List[Tuple[str, str]]:
+def discovered_usns_path(discovered_usns_json: Optional[str], out_dir: Path) -> Path:
+    return Path(discovered_usns_json) if discovered_usns_json else out_dir / "discovered_usns.json"
+
+
+def load_discovered_config(path: Path) -> Tuple[List[Tuple[str, str]], Dict[str, Dict[str, Any]]]:
+    """Load USN/appliance pairs and metadata from a saved auto-discovery JSON file."""
+    if not path.exists():
+        raise FileNotFoundError(f"Discovered USNs JSON not found: {path}")
+
+    try:
+        data = json.loads(path.read_text())
+    except Exception as e:
+        raise ValueError(f"Discovered USNs JSON is not valid JSON: {path}: {e}") from e
+
+    usns_obj = data.get("usns") if isinstance(data, dict) else None
+    if not isinstance(usns_obj, dict):
+        raise ValueError(f"Discovered USNs JSON must contain an object at key 'usns': {path}")
+
     pairs: List[Tuple[str, str]] = []
-    for usn, telemetries in (usns_cfg or {}).items():
-        for t in telemetries:
-            pairs.append((usn, t))
-    return pairs
+    usn_metadata: Dict[str, Dict[str, Any]] = {}
+
+    for usn_id, info in usns_obj.items():
+        if not isinstance(info, dict):
+            raise ValueError(f"Discovered USN entry must be an object for {usn_id}: {path}")
+
+        appliances = info.get("appliances", [])
+        if not isinstance(appliances, list):
+            raise ValueError(f"Discovered USN appliances must be a list for {usn_id}: {path}")
+
+        appliance_types = info.get("appliance_types", {})
+        if not isinstance(appliance_types, dict):
+            appliance_types = {}
+
+        usn_metadata[usn_id] = {
+            'name': info.get('name', usn_id),
+            'asn_id': info.get('asn_id'),
+            'appliance_types': appliance_types,
+        }
+
+        for appliance in appliances:
+            pairs.append((usn_id, str(appliance)))
+
+    return pairs, usn_metadata
 
 
 # -------------------- Auto-discovery functions --------------------
@@ -1062,7 +1099,7 @@ def main():
     ap.add_argument(
         "--discovered-usns-json",
         default=None,
-        help="Path where auto-discovered USNs/appliances JSON is saved when auto_discover.save_discovered is true. Defaults to <output.directory>/discovered_usns.json.",
+        help="Path for the discovered USNs/appliances JSON. Saved when auto_discover.save_discovered is true and loaded when auto_discover.enabled is false. Defaults to <output.directory>/discovered_usns.json.",
     )
     args = ap.parse_args()
 
@@ -1127,13 +1164,14 @@ def main():
     output_cfg = cfg.get("output", {})
     save_json = bool(output_cfg.get("save_json", True))
     out_dir = Path(output_cfg.get("directory", "data"))
+    discovered_cfg_path = discovered_usns_path(args.discovered_usns_json, out_dir)
 
     influx_cfg = cfg.get('influxdb') if storage_mode == 'influx' else None
 
     # Build session early - needed for both auto-discovery and regular fetching
     session = build_session(timeout=timeout, retries_cfg=retries_cfg, headers=headers)
 
-    # Auto-discovery or manual pairs configuration
+    # Auto-discovery or saved discovery file configuration
     auto_discover_cfg = cfg.get("auto_discover", {})
     if isinstance(auto_discover_cfg, bool):
         auto_discover_cfg = {"enabled": auto_discover_cfg}
@@ -1166,8 +1204,7 @@ def main():
         
         # Optionally save discovered config
         if auto_discover_cfg.get("save_discovered", False):
-            out_cfg_path = Path(args.discovered_usns_json) if args.discovered_usns_json else out_dir / "discovered_usns.json"
-            save_discovered_config(usns_dict, out_cfg_path)
+            save_discovered_config(usns_dict, discovered_cfg_path)
         
         # Extract USN ID -> metadata mapping for tagging (includes appliance_types)
         usn_metadata: Dict[str, Dict[str, Any]] = {
@@ -1179,15 +1216,15 @@ def main():
             for usn_id, info in usns_dict.items()
         }
     else:
-        # Manual mode - use pairs from config (check both 'usns' and 'usns_manual')
-        usns_cfg = cfg.get("usns") or cfg.get("usns_manual") or {}
-        pairs = load_pairs(usns_cfg)
-        if not pairs:
-            logger.error("No USN/telemetry pairs configured under 'usns' or 'usns_manual'")
+        logger.info("Auto-discovery mode disabled - loading USNs and appliances from %s", discovered_cfg_path)
+        try:
+            pairs, usn_metadata = load_discovered_config(discovered_cfg_path)
+        except Exception as e:
+            logger.error("Failed to load discovered USNs JSON: %s", e)
             sys.exit(2)
-        
-        # In manual mode, we don't have USN metadata - will use defaults
-        usn_metadata = {}
+        if not pairs:
+            logger.error("No USN/telemetry pairs found in discovered USNs JSON: %s", discovered_cfg_path)
+            sys.exit(2)
         
         # Authenticate
         try:
