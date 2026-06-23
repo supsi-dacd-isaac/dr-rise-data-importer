@@ -970,6 +970,7 @@ def save_discovered_config(usns_dict: Dict[str, Dict[str, Any]], out_path: Path)
         'usns': usns_dict
     }
     try:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_text(json.dumps(data, indent=2))
         logger.info("Saved discovered configuration to %s", out_path)
     except Exception as e:
@@ -1058,6 +1059,11 @@ def main():
     ap.add_argument("--config", required=True, help="Path to configuration JSON file.")
     ap.add_argument("--log-level", default=None, help="Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL). Overrides config.log_level and config.logging.level.")
     ap.add_argument("--log-file", default=None, help="Optional log file path. Overrides config.logging.file.")
+    ap.add_argument(
+        "--discovered-usns-json",
+        default=None,
+        help="Path where auto-discovered USNs/appliances JSON is saved when auto_discover.save_discovered is true. Defaults to <output.directory>/discovered_usns.json.",
+    )
     args = ap.parse_args()
 
     # Setup logging ASAP (CLI has precedence); may be overridden by config if CLI not provided
@@ -1160,7 +1166,7 @@ def main():
         
         # Optionally save discovered config
         if auto_discover_cfg.get("save_discovered", False):
-            out_cfg_path = out_dir / "discovered_usns.json"
+            out_cfg_path = Path(args.discovered_usns_json) if args.discovered_usns_json else out_dir / "discovered_usns.json"
             save_discovered_config(usns_dict, out_cfg_path)
         
         # Extract USN ID -> metadata mapping for tagging (includes appliance_types)

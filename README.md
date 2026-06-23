@@ -71,6 +71,7 @@ python fetch_telemetry.py --config conf/config_all.json
 - `--config`: Path to configuration JSON file (required)
 - `--log-level`: Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
 - `--log-file`: Optional log file path
+- `--discovered-usns-json`: Optional path for the auto-discovery JSON saved when `auto_discover.save_discovered` is `true` (default: `<output.directory>/discovered_usns.json`)
 
 ### Examples
 
@@ -87,6 +88,11 @@ python fetch_telemetry.py --config conf/config_all.json --log-level DEBUG
 **Run with log file for later analysis:**
 ```bash
 python fetch_telemetry.py --config conf/config_all.json --log-level INFO --log-file logs/import.log
+```
+
+**Save discovered USNs/appliances to a custom JSON file:**
+```bash
+python fetch_telemetry.py --config conf/config_all.json --discovered-usns-json data/site_a_discovered_usns.json
 ```
 
 **Run with manual USN configuration:**
